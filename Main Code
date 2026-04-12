@@ -1,0 +1,197 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "driver/i2c.h"    
+#include "esp_log.h"
+#include "esp_timer.h"
+
+// --- CONFIGURATION ---
+#define I2C_SDA_IO           21    
+#define I2C_SCL_IO           22    
+#define BH1750_ADDR          0x23  
+#define DHT_GPIO             27    
+#define BUTTON_PIN           32    
+
+const int tilt_pins[6] = {4, 16, 17, 18, 19, 23};
+const ledc_channel_t tilt_chans[6] = {
+    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2,
+    LEDC_CHANNEL_3, LEDC_CHANNEL_4, LEDC_CHANNEL_5
+};
+
+typedef enum { MODE_AUTO, MODE_MANUAL } system_mode_t;
+system_mode_t current_mode = MODE_AUTO;
+int current_tilt_angle = 90; // Current physical angle
+
+// --- MOTOR CONTROL ---
+static uint32_t angle_to_duty(int angle) {
+    // 0 degrees = 500us, 180 degrees = 2400us (approx)
+    return (uint32_t)((500 + (angle * 1900 / 180)) * 8191 / 20000);
+}
+
+// *** NEW SLOW MOTION FUNCTION ***
+void set_tilt_slowly(int target_angle) {
+    if (target_angle == current_tilt_angle) return;
+
+    // Determine direction: +1 for opening, -1 for closing
+    int step = (target_angle > current_tilt_angle) ? 1 : -1;
+
+    // Sweep from current to target
+    int angle = current_tilt_angle;
+    while (angle != target_angle) {
+        angle += step;
+        
+        // Update motors with a STAGGERED START to prevent current spikes
+        for (int i = 0; i < 6; i++) {
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, tilt_chans[i], angle_to_duty(angle));
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, tilt_chans[i]);
+            
+            // 5ms delay between each motor firing
+            vTaskDelay(pdMS_TO_TICKS(5)); 
+        }
+        
+        // SPEED CONTROL: Adjust this delay to change overall sweep speed
+        // (Note: The inner loop already takes 30ms total, so keep this lower)
+        vTaskDelay(pdMS_TO_TICKS(15)); 
+    }
+    
+    current_tilt_angle = target_angle;
+}
+
+// --- SENSOR DRIVERS ---
+float read_lux_live() {
+    uint8_t data[2];
+    uint8_t pwr_on = 0x01;
+    uint8_t reset  = 0x07;
+    uint8_t mode   = 0x10; 
+
+    i2c_master_write_to_device(I2C_NUM_0, BH1750_ADDR, &pwr_on, 1, pdMS_TO_TICKS(10));
+    i2c_master_write_to_device(I2C_NUM_0, BH1750_ADDR, &reset, 1, pdMS_TO_TICKS(10));
+    
+    if (i2c_master_write_to_device(I2C_NUM_0, BH1750_ADDR, &mode, 1, pdMS_TO_TICKS(100)) != ESP_OK) return -1.0;
+    vTaskDelay(pdMS_TO_TICKS(180)); 
+    if (i2c_master_read_from_device(I2C_NUM_0, BH1750_ADDR, data, 2, pdMS_TO_TICKS(100)) != ESP_OK) return -1.0;
+    return (float)((data[0] << 8) | data[1]) / 1.2;
+}
+
+bool read_dht22_live(float *temperature, float *humidity) {
+    uint8_t data[5] = {0, 0, 0, 0, 0};
+    uint32_t timeout = 0;
+    gpio_set_direction(DHT_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(DHT_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(DHT_GPIO, 1);
+    esp_rom_delay_us(30);
+    gpio_set_direction(DHT_GPIO, GPIO_MODE_INPUT);
+
+    timeout = 0;
+    while(gpio_get_level(DHT_GPIO) == 1) { if(timeout++ > 100) return false; esp_rom_delay_us(1); }
+    timeout = 0;
+    while(gpio_get_level(DHT_GPIO) == 0) { if(timeout++ > 100) return false; esp_rom_delay_us(1); }
+    timeout = 0;
+    while(gpio_get_level(DHT_GPIO) == 1) { if(timeout++ > 100) return false; esp_rom_delay_us(1); }
+
+    for (int i = 0; i < 40; i++) {
+        timeout = 0;
+        while(gpio_get_level(DHT_GPIO) == 0) { if(timeout++ > 100) return false; esp_rom_delay_us(1); }
+        uint32_t t = 0;
+        while(gpio_get_level(DHT_GPIO) == 1) { if(t++ > 100) return false; esp_rom_delay_us(1); }
+        if (t > 30) data[i / 8] |= (1 << (7 - (i % 8)));
+    }
+    if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+        *humidity = (float)((data[0] << 8) | data[1]) / 10.0;
+        *temperature = (float)(((data[2] & 0x7F) << 8) | data[3]) / 10.0;
+        if (data[2] & 0x80) *temperature *= -1;
+        return true;
+    }
+    return false;
+}
+
+// --- CORE LOGIC & TASKS ---
+void environmental_task(void *pvParameter) {
+    while (1) {
+        float lux = read_lux_live();
+        float temp = 0.0, hum = 0.0;
+        bool dht_success = read_dht22_live(&temp, &hum); 
+
+        if (current_mode == MODE_AUTO) {
+            int target = 90; 
+
+            // --- TEST STAGES: 2-DEGREE GAPS ---
+            if (temp >= 35.0 || lux >= 40000)      target = 0;  // Closed
+            else if (temp >= 33.0 || lux >= 30000) target = 15; // Heat Guard
+            else if (temp >= 31.0 || lux >= 20000) target = 30; // Shaded
+            else if (temp >= 29.0 || lux >= 10000) target = 45; // Balanced
+            else if (temp >= 27.0 || lux >= 5000)  target = 60; // Soft
+            else if (temp >= 25.0 || lux >= 500)   target = 75; // Glimmer
+            else                                   target = 90; // Open
+
+            // This new function handles the slow movement internally
+            set_tilt_slowly(target);
+        }
+
+        printf("\n===============================================================\n");
+        printf("       BIO-INSPIRED AUTONOMOUS SHADING SYSTEM STATUS (2° TEST)   \n");
+        printf("=================================================================\n");
+        printf(" MODE:         %s\n", (current_mode == MODE_AUTO) ? "AUTO" : "MANUAL");
+        printf(" LIGHT (LUX): %.1f\n", (lux == -1.0) ? 0.0 : lux); 
+        printf(" TEMP:        %.1f C\n", temp);
+        printf(" BLIND ANGLE: %d Degrees\n", current_tilt_angle);
+        if (lux == -1.0)  printf(" !! GY-30 ERROR !!\n");
+        if (!dht_success) printf(" !! DHT22 ERROR !!\n");
+        printf("========================================\n");
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); 
+    }
+}
+
+void button_task(void *pvParameter) {
+    int click_count = 0; int64_t last_press = 0; bool button_down = false;
+    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLUP_ONLY);
+
+    while(1) {
+        bool btn_state = gpio_get_level(BUTTON_PIN);
+        if (btn_state == 0 && !button_down) {
+            button_down = true; click_count++;
+            last_press = esp_timer_get_time() / 1000;
+            vTaskDelay(pdMS_TO_TICKS(50));    
+        } else if (btn_state == 1 && button_down) { button_down = false; }
+
+        if (click_count > 0 && !button_down && (esp_timer_get_time()/1000 - last_press) > 800) {
+            if (click_count == 2) { 
+                current_mode = MODE_AUTO; 
+                printf(">> AUTO MODE\n"); 
+            }
+            else if (click_count == 3) { 
+                current_mode = MODE_MANUAL; 
+                set_tilt_slowly(90); 
+                printf(">> MANUAL OPEN\n"); 
+            }
+            else if (click_count == 4) { 
+                current_mode = MODE_MANUAL; 
+                set_tilt_slowly(0);  
+                printf(">> MANUAL CLOSE\n"); 
+            }
+            click_count = 0; 
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void app_main(void) {
+    i2c_config_t conf = { .mode = I2C_MODE_MASTER, .sda_io_num = I2C_SDA_IO, .sda_pullup_en = 1, .scl_io_num = I2C_SCL_IO, .scl_pullup_en = 1, .master.clk_speed = 100000 };
+    i2c_param_config(I2C_NUM_0, &conf);
+    i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+
+    ledc_timer_config_t t_cfg = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0, .duty_resolution = LEDC_TIMER_13_BIT, .freq_hz = 50, .clk_cfg = LEDC_AUTO_CLK };
+    ledc_timer_config(&t_cfg);
+    for (int i = 0; i < 6; i++) {
+        ledc_channel_config_t c = { .gpio_num = tilt_pins[i], .speed_mode = LEDC_LOW_SPEED_MODE, .channel = tilt_chans[i], .timer_sel = LEDC_TIMER_0, .duty = angle_to_duty(90) };
+        ledc_channel_config(&c);
+    }
+    xTaskCreate(button_task, "Btn", 4096, NULL, 10, NULL);
+    xTaskCreate(environmental_task, "Env", 4096, NULL, 5, NULL);
+}
